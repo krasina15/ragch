@@ -5,678 +5,913 @@ import logging
 import time
 import re
 import hashlib
-from typing import List, Dict, Any, Optional, Tuple, Union, Literal, Type, TypeVar, cast
+import gc
+import traceback
+from typing import List, Dict, Any, Optional, Tuple, Union, Literal, Generator, Iterator
+from dataclasses import dataclass
 
-import pandas as pd
-from tqdm import tqdm
-import requests
 import pypdf
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain.embeddings.base import Embeddings
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from pydantic import BaseModel, Field
+import psutil
 
 
-# Define schema models based on the screenshots and challenge requirements
-class PinType(BaseModel):
-    pin_id: Optional[Union[int, str]] = Field(None, description="Pin number or name")
-    type: str = Field(..., description="Pin type")
+# =========================
+# Memory Monitoring Utility
+# =========================
+def log_memory_usage(label: str):
+    """Log current memory usage with a label for tracking."""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    logging.info(f"Memory usage at {label}: {memory_mb:.2f} MB")
 
 
-class IsolationTestVoltage(BaseModel):
-    duration_sec: Optional[int] = None
-    unit: Literal["VDC", "VAC", "Unknown"]
-    voltage: int
-
-
+# =========================
+# Pydantic Models
+# =========================
 class SourceReference(BaseModel):
-    pdf_sha1: str = Field(..., description="SHA1 hash of the PDF file")
-    page_index: int = Field(..., description="Zero-based physical page number in the PDF file")
+    pdf_sha1: str
+    page_index: int
 
 
 class Answer(BaseModel):
-    question_text: Optional[str] = Field(None, description="Text of the question")
-    kind: Optional[Literal["number", "name", "boolean", "names"]] = Field(None, description="Kind of the question")
-    value: Union[float, str, bool, List[str], Literal["N/A"]] = Field(..., description="Answer to the question, according to the question schema")
-    references: List[SourceReference] = Field([], description="References to the source material in the PDF file")
+    question_text: Optional[str] = None
+    kind: Optional[Literal["number", "name", "boolean", "names"]] = None
+    value: Union[float, str, bool, List[str], Literal["N/A"]]
+    references: List[SourceReference] = Field(default_factory=list)
 
 
 class AnswerSubmission(BaseModel):
-    answers: List[Answer] = Field(..., description="List of answers to the questions")
-    team_email: str = Field(..., description="Email that your team used to register for the challenge")
-    submission_name: str = Field(..., description="Unique name of the submission (e.g. experiment name)")
+    answers: List[Answer]
+    team_email: str
+    submission_name: str
 
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+@dataclass
+class EmbeddingJob:
+    """Represents a batch of documents to be embedded."""
+    docs: List[Document]
+    file_sha1: str
 
 
-class EnterpriseRAGChallenge:
-    def __init__(self, 
-                 pdf_dir: str, 
-                 llm_provider: str = "openai",
-                 api_key: Optional[str] = None,
-                 embedding_model: str = "text-embedding-3-large",
-                 chunk_size: int = 1000,
-                 chunk_overlap: int = 200,
-                 top_k_retrieval: int = 7,
-                 model_name: str = "gpt-4o"):
+# =========================
+# PDF Loader & Chunker
+# =========================
+class PDFLoader:
+    """
+    Memory-efficient PDF loader that processes files one at a time and pages in batches.
+    """
+
+    def __init__(
+            self,
+            pdf_dir: str,
+            chunk_size: int,
+            chunk_overlap: int,
+            store_year: bool = False,
+            max_pages_per_file: Optional[int] = None  # Limit pages for very large PDFs
+    ):
+        self.pdf_dir = pdf_dir
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.store_year = store_year
+        self.max_pages_per_file = max_pages_per_file
+
+        # Use more fine-grained separators for financial documents
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            length_function=len,
+            separators=[
+                "\n\n\n",  # Triple line breaks often indicate section boundaries
+                "\n\n",    # Double line breaks
+                "\n",      # Single line breaks
+                ". ",      # End of sentences
+                ";\n",     # List items in financial docs often use semicolons
+                ", ",      # Commas
+                " ",       # Words
+                ""         # Characters
+            ]
+        )
+
+    def calculate_sha1(self, file_path: str) -> str:
+        """Calculate SHA1 hash of a file."""
+        sha1 = hashlib.sha1()
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                sha1.update(chunk)
+        return sha1.hexdigest()
+
+    def extract_year_from_text(self, text: str) -> Optional[int]:
         """
-        Initialize the Enterprise RAG Challenge solver with improved parameters.
+        Attempt to extract year from PDF text, looking for common patterns in annual reports.
+        This is a more sophisticated approach than just using filename.
+        """
+        # Look for "Annual Report YYYY" or "YYYY Annual Report"
+        matches = re.findall(r"Annual Report (?:for|of)?\s*(?:the year)?\s*(?:ended|ending)?\s*(?:in|on)?\s*(20\d{2})", text)
+        if matches:
+            return int(matches[0])
+            
+        # Look for "Fiscal Year YYYY" or "FY YYYY"
+        matches = re.findall(r"(?:Fiscal Year|FY)\s+(20\d{2})", text)
+        if matches:
+            return int(matches[0])
+            
+        # Look for dates like "December 31, 2023"
+        matches = re.findall(r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+(20\d{2})", text)
+        if matches:
+            return int(matches[0])
+            
+        return None
+
+    def extract_company_name(self, text: str) -> Optional[str]:
+        """
+        Attempt to extract company name from the first few pages of text.
+        """
+        # Look for common patterns in annual reports
+        matches = re.findall(r"([\w\s]+)(?:,? Inc\.?|,? Corporation|,? Ltd\.?|,? LLC|,? Limited|\bCorp\.?\b)(?:\s+and(?:\s+its)?\s+Subsidiaries)?", text)
+        if matches:
+            return matches[0].strip() + " " + re.search(r"(Inc\.?|Corporation|Ltd\.?|LLC|Limited|\bCorp\.?\b)", text).group(0)
+            
+        return None
+
+    def yield_chunks(self) -> Generator[Document, None, None]:
+        """
+        Memory-efficient document processing that yields chunks one at a time.
+        """
+        pdf_files = [f for f in os.listdir(self.pdf_dir) if f.endswith(".pdf")]
         
-        Args:
-            pdf_dir: Directory containing PDF files
-            llm_provider: LLM provider ("openai" or "anthropic")
-            api_key: API key for the LLM provider
-            embedding_model: Model to use for embeddings
-            chunk_size: Size of text chunks for embeddings
-            chunk_overlap: Overlap between chunks
-            top_k_retrieval: Number of chunks to retrieve for each question
-            model_name: LLM model to use for answering questions
+        for pdf_file in pdf_files:
+            file_path = os.path.join(self.pdf_dir, pdf_file)
+            try:
+                logging.info(f"Processing {pdf_file}")
+                pdf_sha1 = self.calculate_sha1(file_path)
+                metadata_extras = {}
+                
+                with open(file_path, 'rb') as fh:
+                    reader = pypdf.PdfReader(fh)
+                    num_pages = len(reader.pages)
+                    
+                    # First scan first few pages for year and company name
+                    first_pages_text = ""
+                    for i in range(min(5, num_pages)):
+                        try:
+                            first_pages_text += reader.pages[i].extract_text() + "\n"
+                        except Exception as e:
+                            logging.warning(f"Error reading page {i} for metadata: {e}")
+                            
+                    # Extract metadata from first pages
+                    year = self.extract_year_from_text(first_pages_text)
+                    if year:
+                        metadata_extras["year"] = year
+                        
+                    company = self.extract_company_name(first_pages_text)
+                    if company:
+                        metadata_extras["company"] = company
+                    
+                    # Process all pages
+                    pages_to_process = num_pages
+                    if self.max_pages_per_file and num_pages > self.max_pages_per_file:
+                        logging.warning(f"Limiting {pdf_file} to {self.max_pages_per_file} pages")
+                        pages_to_process = self.max_pages_per_file
+                        
+                    for page_index in range(pages_to_process):
+                        try:
+                            page_obj = reader.pages[page_index]
+                            raw_text = page_obj.extract_text()
+                            if not raw_text or len(raw_text.strip()) < 10:  # Skip nearly empty pages
+                                continue
+                                
+                            # Split page text into chunks
+                            page_docs = self.text_splitter.create_documents([raw_text])
+                            
+                            for doc in page_docs:
+                                # Add detailed metadata to each chunk
+                                doc.metadata.update({
+                                    "source": pdf_file,
+                                    "sha1": pdf_sha1,
+                                    "page": page_index,
+                                    **metadata_extras
+                                })
+                                yield doc
+                                
+                        except Exception as e:
+                            logging.error(f"Error processing page {page_index} of {pdf_file}: {e}")
+                            continue
+                            
+                    # Explicitly clean up to help with memory
+                    del reader
+                    gc.collect()
+                
+            except Exception as e:
+                logging.error(f"Error processing file {pdf_file}: {str(e)}")
+                logging.error(traceback.format_exc())
+                continue
+
+
+# =========================
+# Summarization Utility
+# =========================
+def summarize_text_chunks(
+    text_chunks: List[str], 
+    llm: ChatOpenAI,
+    max_chars: int = 2000  # Reduced from 3000 to save memory
+) -> str:
+    """
+    Summarize multiple text chunks into a single condensed text.
+    This can reduce token usage in the final query.
+
+    Args:
+        text_chunks: list of strings from retrieved docs
+        llm: an LLM object from langchain, e.g. ChatOpenAI
+        max_chars: if text_chunks is huge, we skip some text
+
+    Returns:
+        A short summary as a string.
+    """
+    # Truncate or limit total text to save on tokens
+    combined = []
+    total_len = 0
+    for chunk in text_chunks:
+        if total_len + len(chunk) > max_chars:
+            break
+        combined.append(chunk)
+        total_len += len(chunk)
+
+    context = "\n".join(combined)
+    if not context.strip():
+        return "No relevant text found."
+
+    # Improved prompt for summarization - more specific for financial data
+    prompt = f"""You are an expert financial analyst summarizing key information. 
+Focus on extracting factual financial data points, metrics, and explicit statements.
+
+TEXT:
+{context}
+
+TASK: Create a concise summary that preserves:
+1. All numerical values with their correct units
+2. Company names with exact spelling
+3. Years and dates precisely as stated  
+4. Financial terminology without simplification
+5. Facts rather than interpretations
+
+Do not include any information not present in the source text.
+SUMMARY:
+"""
+
+    resp = llm.invoke(prompt)
+    summary = resp.content.strip()
+    return summary
+
+
+# =========================
+# Main RAG Pipeline
+# =========================
+class EnterpriseRAGChallenge:
+    def __init__(
+        self,
+        pdf_dir: str,
+        llm_provider: str = "openai",
+        api_key: Optional[str] = None,
+        embedding_model: str = "text-embedding-3-small",  # Default changed to a lighter model
+        chunk_size: int = 600,  # Reduced from 800 for memory efficiency
+        chunk_overlap: int = 80,  # Reduced from 100 for memory efficiency
+        two_phase_k1: int = 15,  # Reduced from 20 for memory efficiency
+        final_top_k: int = 5,
+        model_name: str = "gpt-4",
+        use_disk_annoy: bool = True,  # Default changed to True for memory efficiency 
+        annoy_index_path: str = "my_annoy_index",
+        store_year_in_metadata: bool = True,  # Default changed to True
+        filter_year: Optional[int] = None,
+        n_trees: int = 30,  # Increased from 10 for better accuracy
+        batch_size: int = 50,  # New parameter for batched processing
+        max_pages_per_file: Optional[int] = None,  # Limit very large PDFs
+        temp_dir: str = "temp_embeddings"  # Directory for temporary embedding storage
+    ):
+        """
+        Memory-optimized RAG pipeline for annual report analysis.
         """
         self.pdf_dir = pdf_dir
         self.llm_provider = llm_provider
-        self.api_key = api_key or self._get_api_key(llm_provider)
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.embedding_model = embedding_model
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.top_k_retrieval = top_k_retrieval
+
+        self.two_phase_k1 = two_phase_k1
+        self.final_top_k = final_top_k
+
         self.model_name = model_name
-        
-        # Initialize storage for documents
-        self.documents = {}
-        self.document_sha1 = {}
+        self.use_disk_index = use_disk_annoy  # Renamed but kept parameter name for backward compatibility
+        self.faiss_index_path = annoy_index_path # Renamed but kept parameter name for backward compatibility
+        self.store_year_in_metadata = store_year_in_metadata
+        self.filter_year = filter_year
+        self.n_trees = n_trees
+        self.batch_size = batch_size
+        self.max_pages_per_file = max_pages_per_file
+        self.temp_dir = temp_dir
+
+        # Create temp directory if it doesn't exist
+        if not os.path.exists(self.temp_dir):
+            os.makedirs(self.temp_dir)
+
+        # Prepare embeddings - prefer local models for memory efficiency
+        if embedding_model == "text-embedding-ada-002":
+            self.embeddings = OpenAIEmbeddings(
+                model=self.embedding_model,
+                openai_api_key=self.api_key
+            )
+        else:
+            # HuggingFace embeddings are more memory-efficient for local use
+            self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
+
+        self._initialize_llm()
         self.vectorstore = None
         
-        # Initialize embeddings
-        if "text-embedding" in embedding_model:
-            self.embeddings = OpenAIEmbeddings(model=embedding_model)
-        else:
-            self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+        # Store for documents and their metadata
+        self.document_store = {}
         
-        # Initialize LLM based on provider
-        self._initialize_llm()
-    
-    def _get_api_key(self, provider: str) -> str:
-        """Get API key from environment variables based on provider."""
-        if provider == "openai":
-            return os.environ.get("OPENAI_API_KEY")
-        elif provider == "anthropic":
-            return os.environ.get("ANTHROPIC_API_KEY")
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
-    
+        # Maintain a mapping of document chunks to their sources for reference tracking
+        self.chunk_to_source_map = {}
+
     def _initialize_llm(self):
-        """Initialize the LLM based on the provider."""
+        """Initialize the LLM based on provider configuration."""
         if self.llm_provider == "openai":
             self.llm = ChatOpenAI(
                 model_name=self.model_name,
                 temperature=0,
-                api_key=self.api_key
-            )
-        elif self.llm_provider == "anthropic":
-            self.llm = Anthropic(
-                model="claude-3-opus-20240229",
-                temperature=0,
-                api_key=self.api_key
+                openai_api_key=self.api_key
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
-    
-    def calculate_sha1(self, file_path: str) -> str:
-        """Calculate SHA1 hash for a file."""
-        sha1 = hashlib.sha1()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(8192):
-                sha1.update(chunk)
-        return sha1.hexdigest()
-    
-    def load_pdfs(self):
-        """Load all PDFs from the directory and calculate their SHA1 hashes."""
-        logger.info(f"Loading PDFs from {self.pdf_dir}")
+
+    def build_vectorstore_in_batches(self):
+        """
+        Memory-efficient vector store building that processes documents in batches.
+        With FAISS, we can add documents incrementally to the index.
+        """
+        log_memory_usage("Before building vectorstore")
         
-        for filename in tqdm(os.listdir(self.pdf_dir), desc="Loading PDFs"):
-            if filename.endswith(".pdf"):
-                file_path = os.path.join(self.pdf_dir, filename)
-                sha1 = self.calculate_sha1(file_path)
-                
-                # Extract text from PDF with page tracking
-                pages_text = self._extract_text_from_pdf_with_pages(file_path)
-                
-                # Store document and its hash
-                self.documents[filename] = pages_text
-                self.document_sha1[filename] = sha1
-                
-                logger.info(f"Loaded {filename} with SHA1: {sha1}")
-        
-        logger.info(f"Loaded {len(self.documents)} PDF documents")
-    
-    def _extract_text_from_pdf_with_pages(self, file_path: str) -> Dict[int, str]:
-        """Extract text from a PDF file with page numbers as a dictionary."""
-        pages_text = {}
-        try:
-            with open(file_path, 'rb') as file:
-                pdf_reader = pypdf.PdfReader(file)
-                page_count = len(pdf_reader.pages)
-                
-                for page_num in range(page_count):
-                    page = pdf_reader.pages[page_num]
-                    page_text = page.extract_text()
-                    if page_text:
-                        pages_text[page_num] = page_text.strip()
-            
-            return pages_text
-        except Exception as e:
-            logger.error(f"Error extracting text from {file_path}: {e}")
-            return {}
-    
-    def create_vector_store(self):
-        """Create a vector store from the loaded documents with improved chunking strategy."""
-        logger.info("Creating vector store...")
-        
-        # Prepare documents for vectorization
-        all_docs = []
-        for filename, pages_text in self.documents.items():
-            sha1 = self.document_sha1[filename]
-            
-            for page_num, text in pages_text.items():
-                # Add header with metadata for each page
-                doc = Document(
-                    page_content=text,
-                    metadata={
-                        "source": filename,
-                        "sha1": sha1,
-                        "page": page_num,
-                        # Include first 100 chars as metadata to help with retrieval
-                        "preview": text[:100] if len(text) > 100 else text
-                    }
-                )
-                all_docs.append(doc)
-        
-        # Split texts with optimized parameters
-        text_splitter = RecursiveCharacterTextSplitter(
+        loader = PDFLoader(
+            pdf_dir=self.pdf_dir,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", ", ", " ", ""]
+            store_year=self.store_year_in_metadata,
+            max_pages_per_file=self.max_pages_per_file
         )
-        all_splits = text_splitter.split_documents(all_docs)
+
+        # Process in batches
+        batch = []
+        batch_count = 0
+        doc_count = 0
         
-        # Add chunk index to metadata
-        for i, doc in enumerate(all_splits):
-            doc.metadata["chunk_id"] = i
+        logging.info(f"Starting document processing in batches of {self.batch_size}")
         
-        # Create vector store
-        self.vectorstore = FAISS.from_documents(all_splits, self.embeddings)
-        logger.info(f"Vector store created with {len(all_splits)} document chunks")
-    
-    def answer_questions(self, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Answer a list of questions using the improved RAG system."""
-        logger.info(f"Answering {len(questions)} questions...")
-        
-        answers = []
-        
-        for i, question_obj in enumerate(tqdm(questions, desc="Processing questions")):
-            question_text = question_obj["text"]
-            question_kind = question_obj["kind"]
+        for doc in loader.yield_chunks():
+            # Track document sources for later reference
+            doc_id = f"{doc_count}"
+            self.chunk_to_source_map[doc_id] = {
+                "sha1": doc.metadata.get("sha1", ""),
+                "page": doc.metadata.get("page", 0),
+                "source": doc.metadata.get("source", ""),
+                "content": doc.page_content[:100] + "..."  # Store a snippet for debugging
+            }
             
-            logger.info(f"Processing question {i+1}/{len(questions)}: {question_text}")
+            # Add document ID to metadata
+            doc.metadata["doc_id"] = doc_id
             
-            # Try up to 3 times with different retrievals if needed
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    # Gradually increase k for retrieval in subsequent attempts
-                    k_retrieval = self.top_k_retrieval + (attempt * 2)
-                    answer, references = self._answer_single_question(
-                        question_text, 
-                        question_kind,
-                        k=k_retrieval
-                    )
-                    break
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt+1} failed: {e}")
-                    if attempt == max_attempts - 1:
-                        # If all attempts fail, return N/A
-                        logger.error(f"All attempts failed for question: {question_text}")
-                        answer = "N/A" if question_kind != "names" else []
-                        references = []
+            batch.append(doc)
+            doc_count += 1
             
-            answers.append({
-                "value": answer,
-                "references": references
-            })
-        
-        return answers
-    
-    def _answer_single_question(self, question: str, question_kind: str, k: int = None) -> Tuple[Any, List[Dict[str, Any]]]:
-        """Answer a single question using enhanced RAG approach."""
-        if k is None:
-            k = self.top_k_retrieval
-            
-        # Create search query with question type hints
-        search_query = self._enhance_query_for_search(question, question_kind)
-        
-        # Retrieve relevant documents
-        retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
-        relevant_docs = retriever.get_relevant_documents(search_query)
-        
-        # Sort documents by relevance and page number for more coherent context
-        relevant_docs.sort(key=lambda x: (x.metadata.get("page", 0)))
-        
-        # Create context from relevant documents
-        context = self._format_context_from_docs(relevant_docs)
-        
-        # Prepare the prompt based on question type and enhance with anti-hallucination instructions
-        prompt_template = self._get_enhanced_prompt_template(question_kind)
-        
-        # Execute query
-        response = prompt_template.format(
-            context=context,
-            query=question
-        )
-        
-        # Use the LLM directly for more control
-        if self.llm_provider == "openai":
-            result = self.llm.invoke(response)
-            answer = result.content
-        else:
-            result = self.llm.invoke(response)
-            answer = result
-            
-        # Format the answer based on the question kind
-        formatted_answer = self._format_answer(answer, question_kind)
-        
-        # Extract references
-        references = self._extract_references(relevant_docs)
-        
-        # Validate the answer
-        self._validate_answer(formatted_answer, question_kind)
-        
-        return formatted_answer, references
-    
-    def _enhance_query_for_search(self, question: str, question_kind: str) -> str:
-        """Enhance the query to improve retrieval by adding type-specific keywords."""
-        # Extract main entities and key terms from the question
-        entities = re.findall(r'"([^"]*)"', question)
-        entities_str = " ".join(entities)
-        
-        # Add type-specific search terms
-        if question_kind == "number":
-            # For numerical questions, focus on finding statistics, figures, amounts
-            hints = "financial figures statistics amounts numbers data"
-        elif question_kind == "boolean":
-            # For yes/no questions, focus on finding facts and statements
-            hints = "facts information statements"
-        elif question_kind in ["name", "names"]:
-            # For name questions, focus on finding entities
-            hints = "names entities people positions executives titles"
-        else:
-            hints = ""
-            
-        # Combine original question with enhanced terms
-        enhanced_query = f"{question} {entities_str} {hints}"
-        return enhanced_query
-    
-    def _format_context_from_docs(self, docs: List[Document]) -> str:
-        """Format retrieved documents into a context string with improved structure."""
-        if not docs:
-            return "No relevant information found in the provided documents."
-            
-        context_parts = []
-        
-        # Group documents by source and page
-        doc_groups = {}
-        for doc in docs:
-            source = doc.metadata.get("source", "Unknown")
-            sha1 = doc.metadata.get("sha1", "Unknown")
-            page = doc.metadata.get("page", 0)
-            
-            key = (source, sha1, page)
-            if key not in doc_groups:
-                doc_groups[key] = []
+            # Process batch when it reaches batch_size
+            if len(batch) >= self.batch_size:
+                self._process_batch(batch)
+                batch_count += 1
+                batch = []
                 
-            doc_groups[key].append(doc)
+                # Periodically save index to disk if configured
+                if self.use_disk_index and batch_count % 10 == 0:
+                    self.save_faiss_index()
+                
+                # Force garbage collection to free memory
+                gc.collect()
+                
+                if batch_count % 5 == 0:
+                    log_memory_usage(f"After processing {batch_count} batches ({doc_count} docs)")
         
-        # Format each group
-        for (source, sha1, page), group_docs in doc_groups.items():
-            content = "\n".join([doc.page_content for doc in group_docs])
+        # Process final batch if not empty
+        if batch:
+            self._process_batch(batch)
             
-            context_parts.append(
-                f"SOURCE: {source}\n"
-                f"DOCUMENT_ID: {sha1}\n"
-                f"PAGE: {page}\n"
-                f"CONTENT:\n{content}\n"
-                f"{'=' * 50}\n"
-            )
+        logging.info(f"Completed processing {doc_count} documents in {batch_count + 1} batches")
         
-        return "\n".join(context_parts)
+        # Save final index to disk
+        if self.use_disk_index:
+            self.save_faiss_index()
+        
+        log_memory_usage("After building vectorstore")
+
+    def _process_batch(self, batch: List[Document]):
+        """Process a batch of documents, adding them incrementally to the FAISS index."""
+        try:
+            if not batch:
+                return
+                
+            # Store documents for reference lookup
+            for doc in batch:
+                doc_id = doc.metadata.get("doc_id")
+                if doc_id not in self.document_store:
+                    self.document_store[doc_id] = doc
+            
+            # Add to existing vectorstore if we have one
+            if self.vectorstore is not None:
+                self.vectorstore.add_documents(batch)
+            else:
+                # Initialize the vectorstore with the first batch
+                self.vectorstore = FAISS.from_documents(
+                    documents=batch,
+                    embedding=self.embeddings
+                )
+                
+        except Exception as e:
+            logging.error(f"Error processing batch: {e}")
+            logging.error(traceback.format_exc())
+
+    def save_faiss_index(self):
+        """Save the FAISS index to disk if configured to do so."""
+        if not self.use_disk_index or not self.vectorstore:
+            return
+            
+        try:
+            # Save FAISS index
+            logging.info(f"Saving FAISS index to {self.faiss_index_path}")
+            self.vectorstore.save_local(self.faiss_index_path)
+            
+            # Save metadata alongside index for document reference lookups
+            metadata_path = os.path.join(self.faiss_index_path, "chunk_metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(self.chunk_to_source_map, f)
+                
+            logging.info(f"Saved index metadata to {metadata_path}")
+            
+        except Exception as e:
+            logging.error(f"Error saving FAISS index: {e}")
+            logging.error(traceback.format_exc())
     
-    def _get_enhanced_prompt_template(self, question_kind: str) -> PromptTemplate:
-        """Get enhanced prompt templates with anti-hallucination instructions and specific formatting guidance."""
-        
-        # Common anti-hallucination instructions
-        anti_hallucination = """
-IMPORTANT: Only answer based on the information provided in the context above. If the information needed to answer the question is not present in the context, respond with 'N/A'. Do not make up or infer information that is not explicitly stated. If only partial information is available, provide only that partial information without speculation.
-
-For each piece of information you include in your answer, identify which source document and page it comes from.
-"""
-        
-        # Common prompt template for all question types
-        template_start = """You are a precise financial document analyst tasked with answering questions about company information from annual reports.
-
-CONTEXT:
-{context}
-
-QUESTION:
-{query}
-"""
-
-        # Type-specific instructions
-        if question_kind == "number":
-            template_specific = """
-INSTRUCTIONS:
-1. Answer with ONLY a numeric value, with no additional text, words, or symbols.
-2. For currency values, include ONLY the number (no currency symbols).
-3. Use decimal points for fractional values (e.g., 12.5).
-4. Do not use commas as thousand separators.
-5. If the exact number isn't specified in the context, answer with 'N/A'.
-6. Do not round or approximate unless the source text specifically does so.
-"""
-        elif question_kind == "boolean":
-            template_specific = """
-INSTRUCTIONS:
-1. Answer ONLY with 'yes' or 'no'.
-2. If the information cannot be determined from the context, answer with 'N/A'.
-3. For comparing two companies, only answer 'yes' or 'no' if both companies have the relevant information.
-4. Remember that absence of evidence is not evidence of absence - only answer 'no' if there is explicit contradictory information.
-"""
-        elif question_kind == "name":
-            template_specific = """
-INSTRUCTIONS:
-1. Answer with ONLY the exact name requested.
-2. Provide the full, properly formatted name without additional commentary.
-3. If the information is not in the context, answer with 'N/A'.
-4. Do not make assumptions about names based on titles or partial information.
-"""
-        elif question_kind == "names":
-            template_specific = """
-INSTRUCTIONS:
-1. Answer with a list of names, separated by commas if there are multiple.
-2. Provide complete, properly formatted names.
-3. If there are no names that match the criteria, or if the information is not in the context, answer with 'N/A'.
-4. Include ALL relevant names that match the criteria in the question.
-5. Return the list in chronological or importance order if that information is available.
-"""
+    def build_or_load_vectorstore(self):
+        """Build or load the FAISS vector store from disk."""
+        if self.use_disk_index and os.path.exists(self.faiss_index_path):
+            logging.info("Loading FAISS index from disk...")
+            try:
+                # Load FAISS index
+                self.vectorstore = FAISS.load_local(
+                    self.faiss_index_path, 
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                
+                # Load document metadata if available
+                metadata_path = os.path.join(self.faiss_index_path, "chunk_metadata.json")
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, 'r') as f:
+                        self.chunk_to_source_map = json.load(f)
+                    logging.info(f"Loaded metadata for {len(self.chunk_to_source_map)} chunks")
+                else:
+                    logging.warning("No metadata file found alongside index")
+                
+                # Validate the loaded index
+                if not self.vectorstore:
+                    logging.warning("Failed to load valid index, rebuilding...")
+                    self.build_vectorstore_in_batches()
+            except Exception as e:
+                logging.error(f"Error loading index: {e}")
+                logging.error(traceback.format_exc())
+                self.build_vectorstore_in_batches()
         else:
-            template_specific = """
-INSTRUCTIONS:
-1. Answer the question directly and concisely based only on the context provided.
-2. If the information is not available in the context, answer with 'N/A'.
-"""
+            logging.info("Building FAISS index from scratch...")
+            self.build_vectorstore_in_batches()
 
-        template_end = """
-ANSWER FORMAT:
-Your answer should contain only the requested information in the exact format specified above.
-
-ANSWER:
-"""
-
-        full_template = template_start + template_specific + anti_hallucination + template_end
-        return PromptTemplate(template=full_template, input_variables=["context", "query"])
-    
-    def _format_answer(self, answer: str, question_kind: str) -> Any:
-        """Format the answer based on the question kind with improved parsing."""
-        # Clean up the answer (remove quotes, extra spaces, etc.)
-        answer = answer.strip().strip('"\'').strip()
+    def filter_docs_by_metadata(self, docs: List[Document]) -> List[Document]:
+        """Filter documents by metadata criteria."""
+        if not docs:
+            return []
+            
+        filtered_docs = docs
         
-        # Handle N/A answers
-        na_patterns = ["n/a", "not available", "no information", "not applicable",
-                      "cannot be determined", "insufficient information"]
+        # Filter by year if specified
+        if self.filter_year is not None:
+            filtered_docs = [d for d in filtered_docs if d.metadata.get("year") == self.filter_year]
+            
+        return filtered_docs
+
+    def rerank_documents(self, docs: List[Document], query: str) -> List[Document]:
+        """
+        Rerank documents based on relevance to the query.
+        This is a more sophisticated reranking than just taking the top K by order.
+        """
+        if not docs:
+            return []
+            
+        # For a proper implementation, we'd use a cross-encoder model
+        # But for memory constraints, we'll use a simple keyword matching approach
+        query_keywords = set(query.lower().split())
+        scored_docs = []
         
-        if any(pattern in answer.lower() for pattern in na_patterns):
+        for doc in docs:
+            # Simple keyword matching score
+            doc_text = doc.page_content.lower()
+            score = sum(1 for kw in query_keywords if kw in doc_text)
+            
+            # Boost score for exact phrase matches
+            if query.lower() in doc_text:
+                score += 5
+                
+            # Add distance to score with some weighting
+            scored_docs.append((doc, score))
+            
+        # Sort by score descending
+        sorted_docs = [doc for doc, score in sorted(scored_docs, key=lambda x: x[1], reverse=True)]
+        return sorted_docs
+
+    def retrieve_context_with_references(self, question: str) -> Tuple[str, List[SourceReference]]:
+        """
+        Retrieve and summarize relevant context while tracking source references.
+        Returns the summarized context and a list of source references.
+        """
+        # Ensure vector store is built
+        if not self.vectorstore:
+            self.build_or_load_vectorstore()
+            
+        # Create retriever with larger k for initial retrieval
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.two_phase_k1})
+        
+        try:
+            # Retrieve initial documents
+            docs_stage1 = retriever.get_relevant_documents(question)
+            log_memory_usage("After initial retrieval")
+            
+            # Filter by metadata
+            docs_stage1 = self.filter_docs_by_metadata(docs_stage1)
+            
+            # Rerank documents based on relevance to question
+            reranked_docs = self.rerank_documents(docs_stage1, question)
+            
+            # Take final top K
+            docs_final = reranked_docs[:self.final_top_k]
+            
+            # Extract source references
+            references = []
+            for doc in docs_final:
+                # First try using doc_id
+                doc_id = doc.metadata.get("doc_id")
+                if doc_id and doc_id in self.chunk_to_source_map:
+                    source_info = self.chunk_to_source_map[doc_id]
+                    references.append(
+                        SourceReference(
+                            pdf_sha1=source_info["sha1"],
+                            page_index=source_info["page"]
+                        )
+                    )
+                else:
+                    # Fallback to metadata directly (for FAISS, the metadata should still be in the docs)
+                    sha1 = doc.metadata.get("sha1")
+                    page = doc.metadata.get("page", 0)
+                    if sha1:
+                        references.append(
+                            SourceReference(
+                                pdf_sha1=sha1,
+                                page_index=page
+                            )
+                        )
+            
+            # Prepare text chunks for summarization
+            text_chunks = []
+            for doc in docs_final:
+                chunk_text = f"(Document: {doc.metadata.get('source','?')}, Page: {doc.metadata.get('page','?')}) {doc.page_content}"
+                text_chunks.append(chunk_text)
+                
+            # Summarize the final content
+            summary = summarize_text_chunks(text_chunks, self.llm)
+            
+            return summary, references
+            
+        except Exception as e:
+            logging.error(f"Error in retrieval: {e}")
+            logging.error(traceback.format_exc())
+            return "Error retrieving context.", []
+
+    def answer_single_question(
+        self,
+        question_text: str,
+        question_kind: str
+    ) -> Tuple[Any, List[SourceReference]]:
+        """
+        Retrieve context, answer the question, and track references.
+        """
+        # Get context and references
+        unified_context, references = self.retrieve_context_with_references(question_text)
+        
+        # Construct prompt based on question kind
+        final_prompt = self._construct_prompt(question_text, unified_context, question_kind)
+        
+        try:
+            # Get answer from LLM
+            llm_result = self.llm.invoke(final_prompt)
+            raw_answer = llm_result.content.strip()
+            
+            # Parse and validate answer based on question kind
+            final_answer = self._post_process_answer(raw_answer, question_kind)
+            
+            return final_answer, references
+            
+        except Exception as e:
+            logging.error(f"Error generating answer: {e}")
+            # Return N/A with any references found
+            if question_kind == "names":
+                return [], references
+            else:
+                return "N/A", references
+
+    def _construct_prompt(self, question_text: str, context: str, question_kind: str) -> str:
+        """Create a prompt tailored to the question type."""
+        # Base instructions
+        instructions = (
+            "You are a precise financial analyst extracting specific information from annual reports. "
+            "Use ONLY the information in the provided context to answer the question. "
+            "If the exact information is not in the context, respond with 'N/A'. "
+            "DO NOT make up or infer data not explicitly stated in the context.\n\n"
+        )
+        
+        # Add question-specific formatting instructions based on kind
+        if question_kind == "number":
+            instructions += (
+                "FORMAT INSTRUCTIONS: Your answer must be a NUMBER ONLY without any text, symbols, "
+                "or currency notations. For example: 42.5 or 1000 or 0.75\n"
+                "If the number is present but with different units, convert it to match the question's units.\n"
+            )
+        elif question_kind == "boolean":
+            instructions += (
+                "FORMAT INSTRUCTIONS: Your answer must be either 'yes' or 'no' only.\n"
+                "Answer 'N/A' if there's not enough information to determine with certainty.\n"
+            )
+        elif question_kind == "name":
+            instructions += (
+                "FORMAT INSTRUCTIONS: Your answer must be a NAME ONLY, without additional description "
+                "or explanation. For example: 'John Smith' or 'Acme Corporation'.\n"
+            )
+        elif question_kind == "names":
+            instructions += (
+                "FORMAT INSTRUCTIONS: Your answer must be a list of names separated by commas. "
+                "Include only the names, not descriptions or explanations. "
+                "Return an empty list [] if no names are found.\n"
+            )
+            
+        # Construct the final prompt
+        return f"{instructions}CONTEXT:\n{context}\n\nQUESTION: {question_text}\nANSWER:"
+
+    def _post_process_answer(self, raw_answer: str, question_kind: str):
+        """
+        Process the LLM's response into the correct format for the question type.
+        This includes handling edge cases and ensuring consistent output.
+        """
+        raw_lower = raw_answer.lower().strip()
+        
+        # Handle any variations of "not applicable" with standardized N/A
+        if any(phrase in raw_lower for phrase in ["n/a", "not applicable", "insufficient info", "no information", "cannot determine", "not enough"]):
             if question_kind == "names":
                 return []
             return "N/A"
-        
-        if question_kind == "number":
-            # Try to extract a number from the answer
-            try:
-                # First check for currency values with symbols
-                currency_match = re.search(r'([\$€£¥])\s*([0-9,]+(\.[0-9]+)?)', answer)
-                if currency_match:
-                    number_str = currency_match.group(2).replace(',', '')
-                    return float(number_str)
-                
-                # Then look for plain numbers
-                number_match = re.search(r'([0-9,]+(\.[0-9]+)?)', answer)
-                if number_match:
-                    number_str = number_match.group(1).replace(',', '')
-                    return float(number_str)
-                
-                # If no match or can't convert to float, return original
-                return answer if answer else "N/A"
-            except Exception:
-                return answer if answer else "N/A"
             
-        elif question_kind == "boolean":
-            # Convert to boolean response
-            answer_lower = answer.lower()
-            if any(affirmative in answer_lower for affirmative in ["yes", "true", "correct"]):
+        if question_kind == "boolean":
+            # Handle boolean questions
+            if any(affirmative in raw_lower for affirmative in ["yes", "true", "correct", "affirmative"]):
                 return "yes"
-            elif any(negative in answer_lower for negative in ["no", "false", "incorrect"]):
+            elif any(negative in raw_lower for negative in ["no", "false", "incorrect", "negative"]):
                 return "no"
-            return answer if answer else "N/A"
+            else:
+                return "N/A"
+                
+        elif question_kind == "number":
+            # Handle numeric questions
+            # Look for numbers in the response, prioritizing those with decimal points and proper formatting
+            # More sophisticated regex to extract numeric values
+            matches = re.findall(r"(-?\d+(?:\.\d+)?)", raw_lower)
+            if matches:
+                # Filter and prioritize numbers that look like they're the main answer
+                if len(matches) == 1:
+                    return matches[0]
+                    
+                # If multiple matches, try to find the one most likely to be the answer
+                # For example, prefer a number that follows "is" or appears at the start/end
+                for pattern in [r"is\s+(-?\d+(?:\.\d+)?)", r"equals\s+(-?\d+(?:\.\d+)?)", r"^(-?\d+(?:\.\d+)?)", r"(-?\d+(?:\.\d+)?)\s*$"]:
+                    specific_match = re.search(pattern, raw_lower)
+                    if specific_match:
+                        return specific_match.group(1)
+                        
+                # Default to first match if no better option
+                return matches[0]
+            return "N/A"
             
         elif question_kind == "names":
-            # Convert to a list of names
-            if not answer or answer.lower() == "n/a":
+            # Handle list of names questions
+            if "n/a" in raw_lower or "[]" in raw_lower or "none" in raw_lower:
                 return []
                 
-            # Handle different separators
-            if "," in answer:
-                names = [name.strip() for name in answer.split(",")]
-            elif " and " in answer:
-                names = [name.strip() for name in answer.split(" and ")]
-            elif ";" in answer:
-                names = [name.strip() for name in answer.split(";")]
-            elif "\n" in answer:
-                names = [name.strip() for name in answer.split("\n") if name.strip()]
-            else:
-                names = [answer]
+            # Try to parse a list from the response
+            if "[" in raw_answer and "]" in raw_answer:
+                # Extract content between brackets
+                list_content = re.search(r"\[(.*?)\]", raw_answer).group(1)
+                names = [name.strip().strip('"\'') for name in list_content.split(",") if name.strip()]
+                return names
                 
-            # Filter out any empty strings
-            names = [name for name in names if name]
+            # Handle comma-separated names
+            names = [name.strip() for name in re.split(r",|\band\b|\n", raw_answer) if name.strip()]
             return names
             
-        # For name type, return as is
-        return answer if answer else "N/A"
-    
-    def _validate_answer(self, answer: Any, question_kind: str) -> None:
-        """Validate that the answer matches the expected type."""
-        if answer == "N/A":
-            return
-            
-        if question_kind == "number":
-            if not isinstance(answer, (int, float)) and not (isinstance(answer, str) and answer == "N/A"):
-                logger.warning(f"Expected number but got: {answer}")
+        else:  # "name" or default
+            # Handle single name questions - take just the name without explanation
+            if "n/a" in raw_lower:
+                return "N/A"
                 
-        elif question_kind == "boolean":
-            if not isinstance(answer, str) or answer.lower() not in ["yes", "no", "n/a"]:
-                logger.warning(f"Expected boolean but got: {answer}")
-                
-        elif question_kind == "names":
-            if not isinstance(answer, list):
-                logger.warning(f"Expected list of names but got: {answer}")
-                
-        elif question_kind == "name":
-            if not isinstance(answer, str):
-                logger.warning(f"Expected name string but got: {answer}")
-    
-    def _extract_references(self, docs: List[Document]) -> List[Dict[str, Any]]:
-        """Extract references from relevant documents with improved deduplication."""
-        references = []
-        
-        for doc in docs:
-            sha1 = doc.metadata.get("sha1", "")
-            page_num = doc.metadata.get("page", 0)
-            
-            # Only add reference if it has a valid SHA1 and page
-            if sha1 and isinstance(page_num, int):
-                references.append({
-                    "pdf_sha1": sha1,
-                    "page_index": page_num
-                })
-        
-        # Deduplicate references
-        unique_refs = []
-        seen = set()
-        
-        for ref in references:
-            key = (ref["pdf_sha1"], ref["page_index"])
-            if key not in seen:
-                unique_refs.append(ref)
-                seen.add(key)
-        
-        return unique_refs
-    
-    def create_submission(self, questions: List[Dict[str, Any]], team_email: str, submission_name: str) -> Dict[str, Any]:
-        """Create a submission for the RAG challenge with enhanced validation."""
-        logger.info("Creating submission...")
-        
-        # Load PDFs if not already done
-        if not self.documents:
-            self.load_pdfs()
-        
-        # Create vector store if not already done
+            # Try to extract just the name part
+            lines = raw_answer.split("\n")
+            if len(lines) > 0:
+                # Take the first non-empty line as the answer
+                for line in lines:
+                    if line.strip():
+                        # Further clean up any explanations
+                        name_part = re.split(r"[:\-–]", line)[0].strip()
+                        return name_part
+                        
+            # Fallback to the whole answer
+            return raw_answer
+
+    def answer_questions(self, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Process all questions and return answers with references.
+        This method handles the overall pipeline.
+        """
         if not self.vectorstore:
-            self.create_vector_store()
-        
-        # Generate answers
-        raw_answers = self.answer_questions(questions)
-        
-        # Add question text and kind to each answer
+            self.build_or_load_vectorstore()
+
         answers = []
-        for i, ans in enumerate(raw_answers):
-            if i < len(questions):
-                ans["question_text"] = questions[i]["text"]
-                ans["kind"] = questions[i]["kind"]
-            answers.append(ans)
+        for i, q in enumerate(questions):
+            logging.info(f"Processing question {i+1}/{len(questions)}: {q['text'][:50]}...")
+            q_text = q["text"]
+            q_kind = q.get("kind", "text")
+            
+            try:
+                final_ans, refs = self.answer_single_question(q_text, q_kind)
+                answers.append({
+                    "value": final_ans,
+                    "references": [ref.dict() for ref in refs]
+                })
+                
+                # Log partial progress
+                if (i + 1) % 5 == 0:
+                    log_memory_usage(f"After processing {i+1} questions")
+                    
+            except Exception as e:
+                logging.error(f"Error processing question {i+1}: {str(e)}")
+                logging.error(traceback.format_exc())
+                # Provide fallback answer in case of errors
+                answers.append({
+                    "value": "N/A" if q_kind != "names" else [],
+                    "references": []
+                })
+                
+        return answers
+
+    def create_submission(
+        self,
+        questions: List[Dict[str, Any]],
+        team_email: str,
+        submission_name: str
+    ) -> Dict[str, Any]:
+        """
+        Create the final submission with answers and references.
+        """
+        log_memory_usage("Before answering questions")
+        raw_answers = self.answer_questions(questions)
+        log_memory_usage("After answering questions")
         
-        # Create submission object
+        final_answers = []
+        for q, ans in zip(questions, raw_answers):
+            answer_obj = {
+                "question_text": q["text"],
+                "kind": q["kind"],
+                "value": ans["value"],
+                "references": ans["references"]
+            }
+            final_answers.append(answer_obj)
+            
         submission = {
             "team_email": team_email,
             "submission_name": submission_name,
-            "answers": answers
+            "answers": final_answers
         }
         
-        # Validate submission
+        # Validate submission against schema
         try:
-            AnswerSubmission.model_validate(submission)
-            logger.info("Submission validation successful")
+            AnswerSubmission(**submission)
         except Exception as e:
-            logger.error(f"Submission validation failed: {e}")
+            logging.error(f"Validation error in submission: {str(e)}")
             
         return submission
-    
-    def save_submission(self, submission: Dict[str, Any], output_file: str):
-        """Save the submission to a JSON file."""
-        with open(output_file, 'w') as f:
-            json.dump(submission, f, indent=2)
-        
-        logger.info(f"Submission saved to {output_file}")
-    
-    def submit_to_api(self, submission: Dict[str, Any], api_url: str):
-        """Submit the answers to the competition API."""
-        logger.info(f"Submitting to API: {api_url}")
-        
-        try:
-            # Create a temporary file
-            temp_file = "temp_submission.json"
-            with open(temp_file, 'w') as f:
-                json.dump(submission, f)
-            
-            # Submit using requests
-            files = {
-                "file": ("submission.json", open(temp_file, "rb"), "application/json")
-            }
-            headers = {"accept": "application/json"}
-            
-            response = requests.post(api_url, headers=headers, files=files)
-            
-            # Delete temporary file
-            os.remove(temp_file)
-            
-            if response.status_code == 200:
-                logger.info("Submission successful!")
-                logger.info(f"Response: {response.json()}")
-                return response.json()
-            else:
-                logger.error(f"Submission failed with status code {response.status_code}")
-                logger.error(f"Response: {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error submitting to API: {e}")
-            return None
 
 
+# =========================
+# CLI
+# =========================
 def main():
-    parser = argparse.ArgumentParser(description="Enterprise RAG Challenge Solver")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--pdf_dir", required=True, help="Directory containing PDF files")
-    parser.add_argument("--questions", required=True, help="JSON file containing questions")
-    parser.add_argument("--output", required=True, help="Output file for submission JSON")
-    parser.add_argument("--llm_provider", default="openai", choices=["openai", "anthropic"], help="LLM provider to use")
-    parser.add_argument("--api_key", help="API key for the LLM provider")
+    parser.add_argument("--questions", required=True, help="JSON file with questions")
+    parser.add_argument("--output", required=True, help="Output file for submission")
     parser.add_argument("--team_email", required=True, help="Team email for submission")
     parser.add_argument("--submission_name", required=True, help="Submission name")
-    parser.add_argument("--api_url", help="API URL for submission (optional)")
-    parser.add_argument("--embedding_model", default="text-embedding-3-large", help="Embedding model to use")
-    parser.add_argument("--chunk_size", type=int, default=1000, help="Chunk size for text splitting")
-    parser.add_argument("--chunk_overlap", type=int, default=200, help="Chunk overlap for text splitting")
-    parser.add_argument("--top_k", type=int, default=7, help="Number of chunks to retrieve for each question")
-    parser.add_argument("--model_name", default="gpt-4o", help="LLM model name")
+
+    # RAG pipeline config
+    parser.add_argument("--llm_provider", default="openai", choices=["openai"])
+    parser.add_argument("--api_key", default=None, help="API key for LLM provider")
+    parser.add_argument("--embedding_model", default="all-MiniLM-L6-v2", help="Model for embeddings")
+    parser.add_argument("--chunk_size", type=int, default=600, help="Characters per chunk")
+    parser.add_argument("--chunk_overlap", type=int, default=80, help="Overlap between chunks")
+    parser.add_argument("--two_phase_k1", type=int, default=15, help="First-phase retrieval size")
+    parser.add_argument("--final_top_k", type=int, default=5, help="Final top K after reranking")
+    parser.add_argument("--model_name", default="gpt-3.5-turbo", help="LLM model name")
+    parser.add_argument("--use_disk_annoy", action="store_true", help="Use disk-based Annoy index")
+    parser.add_argument("--annoy_index_path", default="my_annoy_index", help="Path for Annoy index")
+    parser.add_argument("--store_year_in_metadata", action="store_true", help="Extract year from text")
+    parser.add_argument("--filter_year", type=int, default=None, help="Filter by year")
+    parser.add_argument("--n_trees", type=int, default=30, help="Annoy index n_trees param")
+    parser.add_argument("--batch_size", type=int, default=50, help="Documents per batch")
+    parser.add_argument("--max_pages_per_file", type=int, default=None, help="Limit pages for large PDFs")
+    parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     
     args = parser.parse_args()
+
+    # Configure logging
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    logging.basicConfig(level=getattr(logging, args.log_level), format=log_format)
+
+    log_memory_usage("At start")
     
-    # Load questions
-    with open(args.questions, 'r') as f:
-        questions = json.load(f)
-    
-    # Initialize and run the challenge solver
-    rag_challenge = EnterpriseRAGChallenge(
+    try:
+        with open(args.questions, "r") as f:
+            questions_data = json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading questions: {str(e)}")
+        return
+
+    pipeline = EnterpriseRAGChallenge(
         pdf_dir=args.pdf_dir,
         llm_provider=args.llm_provider,
         api_key=args.api_key,
         embedding_model=args.embedding_model,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
-        top_k_retrieval=args.top_k,
-        model_name=args.model_name
+        two_phase_k1=args.two_phase_k1,
+        final_top_k=args.final_top_k,
+        model_name=args.model_name,
+        use_disk_annoy=args.use_disk_annoy,  # Using the original parameter name for compatibility
+        annoy_index_path=args.annoy_index_path,  # Using the original parameter name for compatibility
+        store_year_in_metadata=args.store_year_in_metadata,
+        filter_year=args.filter_year,
+        n_trees=args.n_trees,  # Not used with FAISS but kept for compatibility
+        batch_size=args.batch_size,
+        max_pages_per_file=args.max_pages_per_file
     )
-    
-    # Create submission
-    submission = rag_challenge.create_submission(
-        questions=questions,
-        team_email=args.team_email,
-        submission_name=args.submission_name
-    )
-    
-    # Save submission
-    rag_challenge.save_submission(submission, args.output)
-    
-    # Submit to API if URL provided
-    if args.api_url:
-        rag_challenge.submit_to_api(submission, args.api_url)
+
+    try:
+        submission = pipeline.create_submission(
+            questions_data,
+            team_email=args.team_email,
+            submission_name=args.submission_name
+        )
+
+        with open(args.output, "w") as out_f:
+            json.dump(submission, out_f, indent=2)
+
+        print(f"Submission saved to {args.output}")
+        log_memory_usage("At end")
+        
+    except Exception as e:
+        logging.error(f"Error creating submission: {str(e)}")
+        logging.error(traceback.format_exc())
 
 
 if __name__ == "__main__":
     start_time = time.time()
     main()
-    elapsed_time = time.time() - start_time
-    logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
+    elapsed = time.time() - start_time
+    print(f"Done! Elapsed time: {elapsed:.2f}s")

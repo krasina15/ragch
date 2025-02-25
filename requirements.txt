@@ -1,30 +1,8 @@
-# Core dependencies
-pandas>=2.2.0
-tqdm>=4.66.0
-requests>=2.31.0
-pypdf>=4.0.0  # Update from PyPDF2 for Python 3.13 compatibility
-
-# LangChain dependencies - updated for newer versions
-langchain-core>=0.1.35
-langchain-text-splitters>=0.1.0
-langchain-community>=0.1.0
-langchain-openai>=0.1.0  # For OpenAI integration
-langchain-anthropic>=0.1.0  # For Anthropic integration
-
-# Vector database
-faiss-cpu>=1.8.0
-
-# Embeddings
-sentence-transformers>=2.5.0  # For HuggingFace embeddings
-
-# Schema validation
-pydantic>=2.6.0
-
-# Data processing
-numpy>=1.26.0
-
-# Optional: For development and testing
-pytest>=8.0.0
-black>=24.0.0
-isort>=5.13.0
-mypy>=1.8.0
+langchain>=0.0.101
+annoy>=1.17.1
+pypdf>=3.8.1
+pydantic>=1.10.0
+openai>=0.27.0
+anthropic>=0.2.9
+transformers>=4.28.0
+sentence-transformers>=2.2.2
