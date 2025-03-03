@@ -1,6 +1,9 @@
 # Enterprise RAG Challenge
 
-A robust, memory-optimized Retrieval-Augmented Generation (RAG) system designed to process corporate annual reports and answer specific questions with precise references.
+A robust, memory-optimized Retrieval-Augmented Generation (RAG) system designed to process corporate annual reports and answer specific questions with precise references. 
+
+This code is my personal attempt in the [Enterprise Rag Challange](https://rag.timetoact.at/).
+
 
 ## Overview
 
